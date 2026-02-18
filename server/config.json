@@ -1,0 +1,22 @@
+{
+    "openrouter_api_key": "YOUR_OPENROUTER_API_KEY_HERE",
+    "enable_vl": false,
+    "enable_tts": true,
+    "enable_qwen3": true,
+    "user": {
+    "api": "https://u251497-pr7m-33f5f2de.westd.seetacloud.com:8443",
+    "gpt_sovits": "https://uu251497-pr7m-33f5f2de.westd.seetacloud.com:8443"
+    },
+    "server": {
+        "qwen3": "http://localhost:11434",
+        "qwenvl": "http://localhost:11434"
+    },
+    "display": {
+        "preset": "full",
+        "custom": {
+            "visible_ratio": 0.4,
+            "text_x_offset": 140,
+            "text_y_offset": 20
+        }
+    }
+}

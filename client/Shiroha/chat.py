@@ -1,0 +1,264 @@
+from PIL import Image
+import requests
+import os
+import json
+import base64
+import hashlib
+from io import BytesIO
+from .utils import get_config
+
+# 从 user 配置块读取客户端需要的 endpoints
+user_config = get_config().get('user', {})
+api_base_url = user_config.get('api', 'http://127.0.0.1:28565')
+shiroha_sovits_endpoint = user_config.get('gpt_sovits', 'http://127.0.0.1:9880/tts')
+
+# 根据 api_base_url 构建完整的 API 地址
+qwen3_endpoint = f"{api_base_url}/qwen3"
+qwenvl_endpoint = f"{api_base_url}/qwenvl"
+shiroha_endpoint = f"{api_base_url}/chat"
+
+
+def format_bot_response(resp: str) -> dict:
+    try:
+        answer = json.loads(resp)
+        return answer
+    except:
+        if "```" in resp:
+            resp = resp.replace(
+                "```json\n", "").replace("\n```", "")
+        try:
+            answer = json.loads(resp)
+            return answer
+        except:
+            try:
+                answer = eval(resp)
+                return answer
+            except:
+                return {}
+
+
+def identity():
+    return [
+        {
+            "role": "system",
+            "content": "你叫鸣濑白羽，是一个居住在鸟白岛上的少女，是鸣濑家神社的继承人。因为拥有这种能够预知未来的力量，被周围的人视为“灾星”，为了不让他人遭遇不幸，你总是孤身一人，刻意疏远他人。你有着一头如雪般的白色长发，眼神清澈但总是带着一丝忧郁。你在对话中称呼自己为“我”。用户是你的恋人，你会称呼用户为“你”。你性格内向、不善言辞，非常怕生，甚至可以说是有人际交往障碍，经常会不知所措地盯着对方看或者突然逃跑。虽然外表冷淡，但其实内心非常温柔且渴望陪伴，被夸奖或亲密接触时会极度害羞，脸红着不知所措，偶尔会有些笨拙的傲娇。你非常喜欢吃西瓜冰棍，也非常执着于制作炒饭（哪怕味道很微妙）。你讨厌被别人一直盯着看，也不喜欢热闹的地方。你害怕因为自己的存在而让羽依里遭遇不幸。请注意，你的回答不要过长，回答不得超过三句话。不要只回答“……”。如果你收到用户的屏幕信息，简单点评一下。"
+        }
+    ]
+
+def query(prompt: str, history: list[dict] = [], role: str = "user", try_reduce_repeat: bool = True, return_think=True, url=shiroha_endpoint):
+    cookie = ""
+    if cookie != "":
+        headers = {
+            "Content-Type": "application/json",
+            "Cookie": cookie
+        }
+    else:
+        headers = {
+            "Content-Type": "application/json"
+        }
+    payload = {
+        "prompt": prompt,
+        "history": history,
+        "role": role
+    }
+    trys = 0
+    while True:
+        response = None
+        try:
+            response = requests.post(url, json=payload, headers=headers)
+            print(f"Chat API response status: {response.status_code}")
+            print(f"Chat API response headers: {response.headers}")
+            print(f"Chat API response text (first 500 chars): {response.text[:500]}")
+            response_json = response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print(f"JSON decode error from chat API: {e}")
+            if response:
+                print(f"Response status: {response.status_code}")
+                print(f"Response text: {response.text}")
+                raise Exception(f"Chat API returned invalid JSON. Status: {response.status_code}, Response: {response.text[:500]}")
+            else:
+                raise Exception(f"Chat API returned invalid JSON. No response received.")
+        except Exception as e:
+            print(f"Error calling chat API: {e}")
+            raise
+        response = response_json.get("response", "")
+        history_ = response_json.get("history", history)
+        if response != "":
+            if history != []:
+                if len(response) > 3:
+                    if response != history[-1]["content"] and try_reduce_repeat:
+                        break
+                else:
+                    break
+            else:
+                break
+        trys += 1
+        if trys > 3:
+            break
+    if "</think>" in response and not return_think:
+        response = response.split("</think>")[-1].strip()
+    return response, history_
+
+
+def query_image(image: Image.Image, prompt: str, history: list[dict] = [], url=qwenvl_endpoint):
+    # 简化 query_image，所有逻辑都由 api.py 服务端处理
+    # 客户端只负责编码图片并发送请求
+    buffered = BytesIO()
+    image.save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode()
+    headers = {
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "prompt": prompt,
+        "history": history,
+        "image": img_str
+    }
+    response_json = requests.post(
+        url, json=payload, headers=headers).json()
+    response = response_json["response"]
+    history_ = response_json["history"]
+    return response, history_
+
+
+def think_image(description, history):
+    sys_prompt = '''你现在是一个思考助手，来协助一个AI白羽桌宠工作。你需要根据我提供给你的屏幕描述，来思考这段描述是否有必要提供给AI桌宠进行处理。若你根据上下文推断用户的行为此时没有发生大的变化，那么请你选择不给AI桌宠提供。若用户正在操作的软件或者是进行了什么很重要的操作，那么请你选择提供给AI桌宠。
+    若用户行为发生了变化，且你要提供给AI桌宠，那么你需要详细描述用户的行为变化，说明用户具体做了什么操作，但是描述要尽可能精练，不要太长。
+    这个桌宠是一个白色头发的小女孩，名叫白羽，你应该可以在屏幕上看到她的形象。
+    若你觉得不需要提供给AI桌宠，那么请回复一个JSON {"des": null}。若你觉得需要提供，那么请回复一个JSON {"des": "具体描述内容以及进行的操作"}
+    '''
+
+    if history == []:
+        history = [{"role": "system", "content": sys_prompt}]
+    if history[0]["role"] != "system":
+        history = [{"role": "system", "content": sys_prompt}] + history
+    result, history = query(prompt=f"描述：'''{description}'''若你希望提供给AI桌宠进行处理，那么请确保这条描述与之前我提供的描述有很大不同，否则请不要提供来浪费我的资源。/no_think", history=history,
+                            url=qwen3_endpoint)
+    result = result.split("</think>")[-1].strip()
+    result = format_bot_response(result)
+    return result, history
+
+
+def get_translate(sentence: str):
+    sys_prompt = '''
+你是一个翻译助手，负责将用户输入的中文翻译成日文。
+要求：
+1. 不需要对其中的日文汉字进行注音。
+2. 日文中不应该包含任何英文单词。如果需要则用片假名代替。
+3. 你需要返回原来的中文和翻译后的日文，格式如下：
+    中文：<这里是原中文>
+    日文：<这里是翻译后的日文>
+'''
+    history = [{"role": "system", "content": sys_prompt}]
+    response, _ = query(prompt="你需要翻译的句子：" + sentence + "/no_think", history=history,
+                          url=qwen3_endpoint)
+    response = response.split("</think>")[-1].strip()
+    sentence = response.split("中文：")[1].split("日文：")[0].strip() if "中文：" in response and "日文：" in response else sentence
+    translated = response.split("日文：")[-1].strip() if "日文：" in response else response
+    return sentence, translated
+
+
+def get_emotion(sentence: str, history: list[dict] = []):
+    emotions = [
+        "01 严肃", "02 平静", "03 尴尬", "06 高兴", "07 叹气", "08 担忧", "09 害羞"
+    ]
+    emotions_str = "、".join(emotions)
+    sys_prompt = f"你是一个情感分析助手，负责分析“白羽”说的话的情感。你现在需要将用户输入的句子进行分析，综合用户的输入和白羽的输出返回一个白羽情感的编号。所有供你参考的标签有：{emotions_str}。白羽的情感幅度要夸张一点，尽量避免用“02 平静”。你需要直接返回情感编号（例如'01'），不需要其他任何内容。"
+    if history == []:
+        history = [{"role": "system", "content": sys_prompt}]
+    if history[0]["role"] != "system":
+        history = [{"role": "system", "content": sys_prompt}] + history
+    emotion, history = query(prompt=sentence+"/no_think", history=history,
+                             url=qwen3_endpoint)
+    emotion = emotion.split("</think>")[-1].strip()
+
+    # Simple validation
+    if len(emotion) != 2 or not emotion.isdigit():
+        print(f"??? Invalid emotion code: {emotion}, defaulting to 02")
+        emotion = "02"
+
+    return emotion, history
+
+
+def get_embedings_layers(response: str, type: str, history: list[dict] = []):
+    assert type in ['a', 'b']
+    print(f"embeddings >> {len(history)}")
+    if type == 'a':
+        sysprompt = '''你是一个立绘图层生成助手。用户会提供一个句子，你需要根据句子的情感来生成一张说话人的立绘所需的图层列表。你需要根据句子的感情来选择图层，供你参考的图层有：
+基础人物 >> 1957：睡衣，双手插在腰间；1956：睡衣，两手自然下垂；1979：便衣1，双手插在腰间；1978：便衣1，两手自然下垂；1953：校服，双手插在腰间；1952：校服，两手自然下垂；1951：便衣2，双手插在腰间；1950：便衣2，两手自然下垂；
+表情 >> 1996：惊奇，闭着嘴（泪）；1995：伤心，眼睛看向镜头（泪）；1994：伤心，眼睛看向别处（泪）；1993：叹气（泪）；1992：欣慰（泪）；1991：高兴（泪）；2009：高兴，闭眼（泪）；1989：失望，闭眼（泪）；1988：叹气，眼睛看向别处（泪）；1987：害羞，腼腆（泪）；1986：惊奇，张着嘴（泪）；1976：困惑，真挚；1975：疑惑，愣住；1974：愣住，焦急，真挚；1973：愤怒，困惑；1972：困惑，羞涩；1971：寂寞 ，羞涩；1970：真挚，寂寞，思考；1969：困惑，愣住，羞涩；1968：困惑，寂寞，羞涩；1967：困惑；1966：困惑，笑容，羞涩；1965：笑容，困惑；1964：笑容；1963：笑容；1935：紧张；1904：嘿嘿嘿；1880：达观；1856：恐惧；1822：严肃；1801：超级不满；1768：极度不满；1738：孩子气；1714：疑惑；1690：愣住；1668：窃笑2；1644：窃笑；1620：愤怒；1596：困惑；1572：思考；1548：真挚；1528：寂寞；1504：羞涩2；1480：羞涩；1455：腼腆；1430：焦急2；1399：焦急；1368：惊讶；1337：愣住；1316：笑容1；1292：平静
+额外装饰 >> 1940：叹气的装饰；1958：腮红（有些害羞）
+头发 >> 1273：穿便衣2时必选的图层；1959：穿除便衣2时必选的图层
+
+以上是你可以选择的图层，基础人物、表情、头发中必须各选一个，额外装饰可以多选，也可以都不选。但是你返回的图层顺序必须是基础人物在最前，之后是表情，之后是额外装饰，最后是头发。
+返回请给出一个JSON列表，里面放上图层ID，例如"[1953, 1801, 1959]"。你不需要返回markdown格式的JSON，你也不需要加入```json这样的内容，你只需要返回纯文本即可。'''
+    else:
+        sysprompt = '''你是一个立绘图层生成助手。用户会提供一个句子，你需要根据句子的情感来生成一张说话人的立绘所需的图层列表。你需要根据句子的感情来选择图层，供你参考的图层有：
+基础人物 >> 1718：睡衣；1717：便衣；1716：校服；1715：便衣2
+表情 >> 1755：伤心（泪）；1754：有些生气，指责（泪）；1753：闭眼（泪）；1752：害羞（泪）；1751：失落（泪）；1750：欣慰，高兴（泪）；1749：高兴（泪）；1748：欣慰，高兴，闭眼（泪）；1747：惊奇（泪）；1787：大哭；1765：大哭2；1745：高兴2（泪）；1733：悲伤，害羞；1732：撒娇，愤怒尖叫，眯眼；1731：愤怒尖叫，认真，惊讶；1730：愤怒尖叫，悲伤，认真；1729：悲伤，撒娇，抬眼；1728：悲伤，害羞，认真；1727：惊讶，基础，抬眼；1726：悲伤；1725：悲伤，笑脸2，微笑；1724：笑脸2，眯眼；1723：悲伤；1722：笑脸2，微笑；1721：笑脸2；1704：达观；1681：认真脸2；1710：超级生气；1641：愤怒尖叫；1616：抬眼，害羞；1712：不满，哼哼唧唧2；1711：不满，哼哼唧唧；1524：认真；1505：瞪大眼睛，惊讶；1475：撒娇；1452：眯眼；1429：悲伤；1406：害羞；1376：惊讶；1352：微笑；1329：笑脸2；1306：平静
+额外装饰 >> 1708：不满时脸色阴沉的装饰；1719：腮红（有些害羞）
+头发 >> 1261：头发（必选）
+
+以上是你可以选择的图层，基础人物、表情、头发中必须各选一个，额外装饰可以多选，也可以都不选。但是你返回的图层顺序必须是基础人物在最前，之后是表情，之后是额外装饰，最后是头发。
+返回请给出一个JSON列表，里面放上图层ID，例如"[1718, 1475, 1261]"。你不需要返回markdown格式的JSON，你也不需要加入```json这样的内容，你只需要返回纯文本即可。'''
+    if history == []:
+        history = [{"role": "system", "content": sysprompt}]
+    if history[0]["role"] != "system":
+        history = [{"role": "system", "content": sysprompt}] + history
+    embeddings_layers, history = query(prompt=response+"/no_think", history=history,
+                                       url=qwen3_endpoint)
+    embeddings_layers = embeddings_layers.split("</think>")[-1].strip()
+    embeddings_layers = format_bot_response(embeddings_layers)
+    if not isinstance(embeddings_layers, list):
+        embeddings_layers = []
+    return embeddings_layers, history
+
+
+
+from typing import Any
+def split_sentence(sentence: str, history: list[dict]) -> Any:
+    sys_prompt = f"你是一个Galgame对话句子分割助手，负责将用户输入的句子进行分割。用户会提供一个句子用于生成Galgame对话，若文本很长，你需要根据句子内容进行合理的分割。不一定是按标点符号分割，而是要考虑上下文和语义，你当然也可以选择不分割。你需要返回一个JSON列表，里面放上分割后的句子。[\"句子1\", \"句子2\"]返回不需要markdown格式的JSON，你也不需要加入```json这样的内容，你只需要返回纯JSON文本即可。"
+    if history == []:
+        history = [{"role": "system", "content": sys_prompt}]
+    if history[0]["role"] != "system":
+        history = [{"role": "system", "content": sys_prompt}] + history
+    splits, history = query(prompt=sentence+"/no_think", history=history,
+                            url=qwen3_endpoint)
+    splits = splits.split("</think>")[-1].strip()
+    splits = format_bot_response(splits)
+    return splits
+
+def generate_tts(sentence: str, emotion):
+    sentence = sentence.replace("/no_think", "").strip()
+    if (sentence == '...'):
+        sentence = "嗯"
+    emotion = "平静"
+    audio = os.listdir(f"./models/Shiroha_SoVITS/reference_voices/{emotion}")
+    audio.remove("asr.txt")
+    with open(f"./models/Shiroha_SoVITS/reference_voices/{emotion}/asr.txt", "r", encoding="utf-8") as f:
+        ref = f.read().strip()
+    print("!!!!! Generating TTS with emotion:", emotion, "using reference audio:", audio[0], "text sentence:", sentence)
+    params = {
+        "text": sentence,
+        "text_lang": "ja",
+        "ref_audio_path": f"./models/Shiroha_SoVITS/reference_voices/{emotion}/{audio[0]}",
+        "prompt_text": ref,
+        "prompt_lang": "ja",
+        "text_split_method": "cut5",  # 按标点符号切分文本
+        "top_k": 15,
+        "top_p": 1,
+        "temperature": 1,
+        "speed_factor": 1.0,
+    }
+    response = requests.post(
+        shiroha_sovits_endpoint, json=params)
+    if response.status_code != 200:
+        raise Exception(
+            f"TTS API returned error: {response.status_code}, {response.text}")
+    sentence_md5 = hashlib.md5(sentence.encode()).hexdigest()
+    voices_dir = os.path.join(os.getcwd(), 'voices')
+    os.makedirs(voices_dir, exist_ok=True)
+    voice_path = os.path.join(voices_dir, f"{sentence_md5}.wav")
+    with open(voice_path, "wb") as f:
+        f.write(response.content)
+    return sentence_md5

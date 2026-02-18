@@ -1,0 +1,71 @@
+# --- Web Framework & Server ---
+fastapi==0.116.1
+uvicorn==0.35.0
+gradio<5
+
+# --- Core Scientific & Data Processing ---
+numpy>=1.26.0
+scipy>=1.14.0
+Pillow==11.3.0
+Requests==2.32.5
+PyYAML
+psutil
+chardet
+
+# --- Deep Learning: PyTorch & Ecosystem ---
+torch>=2.0.0
+torchaudio
+pytorch-lightning>=2.4
+torchmetrics<=1.5
+rotary_embedding_torch
+x_transformers
+peft
+
+# --- NLP & Hugging Face Ecosystem ---
+transformers>=4.45.0
+tokenizers>=0.13,<1
+huggingface_hub>=0.13
+modelscope
+ctranslate2>=4.0,<5
+sentencepiece
+
+# --- Computer Vision & Media Processing ---
+opencv_contrib_python==4.11.0.86
+opencv_python==4.11.0.86
+ffmpeg-python
+av>=11
+ar>=1.0.0
+
+# --- Audio & Speech Processing ---
+librosa==0.10.2
+numba
+funasr==1.0.27
+bigvgan>=2.4.1
+feature-extractor>=0.0.1
+utils>=1.0.2
+standard-aifc>=3.13.0
+
+# --- Chinese & Multilingual NLP/G2P Tools ---
+cn2an
+pypinyin
+pyopenjtalk>=0.4.1
+g2p_en
+jieba_fast
+jieba
+split-lang
+fast_langdetect>=0.3.1
+wordsegment
+ToJyutping
+g2pk2
+ko_pron
+opencc
+python_mecab_ko
+
+# --- Logging, Monitoring & Utilities ---
+rich==14.1.0
+tqdm
+tensorboard
+wandb>=0.22.0
+
+# --- Pydantic (Explicitly restricted version) ---
+pydantic<=2.10.6

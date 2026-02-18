@@ -1,0 +1,1112 @@
+from PyQt5.QtMultimedia import QSound
+from PyQt5.QtWidgets import QApplication, QLabel, QSystemTrayIcon, QMenu, QAction, QGraphicsOpacityEffect
+from PyQt5.QtGui import QPixmap, QIcon, QImage, QFont, QPainter, QFontDatabase, QColor
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QEvent, QRect, QSize, pyqtProperty
+from datetime import datetime
+from Shiroha import chat, generate, utils
+import hashlib
+import cv2
+import threading
+import textwrap
+import os
+import time
+import sys
+import json
+import traceback
+import pyautogui
+import xml.etree.ElementTree as ET
+import random
+import re
+
+from Shiroha.terminal_agent import Operationtype, TerminalAgent
+
+
+def wrap_text(text, width=10):
+    return '\n'.join(textwrap.wrap(text, width=width, break_long_words=True, break_on_hyphens=False))
+
+
+class Shiroha(QLabel):
+    # 显示预设配置
+    DISPLAY_PRESETS = {
+        "compact": {
+            "name": "紧凑模式",
+            "visible_ratio": 0.35,
+            "text_x_offset": 80,
+            "text_y_offset": 15,
+            "description": "最节省空间，只显示头部和肩部"
+        },
+        "balanced": {
+            "name": "平衡模式",
+            "visible_ratio": 0.45,
+            "text_x_offset": 100,
+            "text_y_offset": 20,
+            "description": "推荐设置，显示上半身"
+        },
+        "standard": {
+            "name": "标准模式",
+            "visible_ratio": 0.6,
+            "text_x_offset": 110,
+            "text_y_offset": 25,
+            "description": "显示到腰部，适中大小"
+        },
+        "full": {
+            "name": "完整显示",
+            "visible_ratio": 1.0,
+            "text_x_offset": -70,
+            "text_y_offset": 100,
+            "description": "显示完整桌宠"
+        }
+    }
+    
+    def load_shiroha_assets(self):
+        self.shiroha_bodies = []
+        self.shiroha_faces = {}
+        
+        image_dir = os.path.join(os.getcwd(), 'images')
+        if not os.path.exists(image_dir):
+            print(f"Images directory not found: {image_dir}")
+            return
+
+        # Regex for body: bs(2)_sr(\d{2})(\d)(\d)(\d{2})\.png
+        # Group 1: Scale (2)
+        # Group 2: Clothes (01-06)
+        # Group 3: Orientation (0=Front, 1=Side, 2=Back)
+        # Group 4: Pose
+        # Group 5: Variant
+        body_pattern = re.compile(r'bs(2)_sr(\d{2})(\d)(\d)(\d{2})\.png')
+        
+        # Regex for face: bs(2)_sr_f(\d{2})_(\d{2})\.png
+        # Group 1: Scale (2)
+        # Group 2: Face Type (01-25)
+        # Group 3: Variant
+        face_pattern = re.compile(r'bs(2)_sr_f(\d{2})_(\d{2})\.png')
+
+        for f in os.listdir(image_dir):
+            if not f.endswith('.png'):
+                continue
+                
+            b_match = body_pattern.match(f)
+            f_match = face_pattern.match(f)
+            
+            if b_match:
+                self.shiroha_bodies.append({
+                    'file': f,
+                    'scale': b_match.group(1),
+                    'orientation': b_match.group(3),
+                    'pose': b_match.group(4)
+                })
+            elif f_match:
+                scale = f_match.group(1)
+                ftype = f_match.group(2)
+                key = (scale, ftype)
+                if key not in self.shiroha_faces:
+                    self.shiroha_faces[key] = []
+                self.shiroha_faces[key].append(f)
+                
+    def get_shiroha_pixmap(self, emotion_code=None, startup=False):
+        print("DEBUG : get_shiroha_pixmap called with emotion_code =", emotion_code, "startup =", startup)
+        if not hasattr(self, 'shiroha_bodies') or not self.shiroha_bodies:
+            self.load_shiroha_assets()
+            
+        if not self.shiroha_bodies:
+            print("No Shiroha bodies found!")
+            return QPixmap()
+            
+        if startup:
+            # Startup: Front facing (orientation=0), Non-miko (clothes!=04)
+            # Filename format: bs2_sr{clothes}{orientation}{pose}{variant}.png
+            # We want orientation='0' and clothes!='04'
+            # Since we don't have clothes parsed, we check filename for 'sr04'
+            candidate_bodies = self.shiroha_bodies
+            candidate_bodies = [b for b in self.shiroha_bodies 
+                                if b['orientation'] == '0' and 'sr04' not in b['file'] and 'sr03' not in b['file'] and b['pose'] != '3']
+            body_info = random.choice(candidate_bodies)
+            self.body_file = body_info['file']
+            self.scale = body_info['scale']
+            self.orientation = body_info['orientation']
+            self.pose = body_info['pose']
+        body_file = self.body_file
+        scale = self.scale
+        orientation = self.orientation
+        pose = self.pose
+
+        face_file = None
+        
+        # Determine allowed face types based on orientation and pose
+        allowed_types = []
+        if orientation == '0': # Front
+            if pose == '3': # Hands covering mouth
+                # Faces with hands near mouth
+                allowed_types = ['02', '07']
+            else: # Pose 1 or 2
+                # Faces WITHOUT hands near mouth
+                allowed_types = ['01', '05', '06']
+                
+        elif orientation == '1': # Side
+            if pose == '3': # Hands holding head
+                allowed_types = ['12']
+            else: # Pose 1 or 2
+                allowed_types = ['11']
+                
+        elif orientation == '2': # Back
+            allowed_types = [] # No face
+        
+        # Collect candidate faces matching scale and allowed types
+        candidate_faces = []
+        for ftype in allowed_types:
+            key = (scale, ftype)
+            if key in self.shiroha_faces:
+                if emotion_code:
+                    # Filter by emotion suffix
+                    faces_with_emotion = [f for f in self.shiroha_faces[key] if f.endswith(f"_{emotion_code}.png")]
+                    candidate_faces.extend(faces_with_emotion)
+                else:
+                    faces_with_emotion = [f for f in self.shiroha_faces[key] if f.endswith("_02.png")]
+                    candidate_faces.extend(faces_with_emotion)
+
+        if candidate_faces:
+            face_file = random.choice(candidate_faces)
+        elif emotion_code:
+             print(" No faces found for emotion code ", emotion_code, ", falling back to default faces. ")
+             for ftype in allowed_types:
+                key = (scale, ftype)
+                if key in self.shiroha_faces:
+                    candidate_faces.extend([f for f in self.shiroha_faces[key] if f.endswith("_02.png")])
+             if candidate_faces:
+                 face_file = random.choice(candidate_faces)
+        
+        base_path = os.getcwd()
+        body_path = os.path.join(base_path, 'images', body_file)
+        body_xml_path = os.path.join(base_path, 'xml', body_file.replace('.png', '.xml'))
+        
+        body_img = QImage(body_path)
+        if body_img.isNull():
+            print(f"Failed to load body: {body_path}")
+            return QPixmap()
+
+        if face_file:
+            face_path = os.path.join(base_path, 'images', face_file)
+            face_xml_path = os.path.join(base_path, 'xml', face_file.replace('.png', '.xml'))
+            face_img = QImage(face_path)
+            
+            if not face_img.isNull() and os.path.exists(body_xml_path) and os.path.exists(face_xml_path):
+                try:
+                    # Parse XMLs
+                    def get_origin(xml_path):
+                        tree = ET.parse(xml_path)
+                        root = tree.getroot()
+                        origin = root.find('.//origin')
+                        return int(origin.get('x')), int(origin.get('y'))
+                        
+                    bx, by = get_origin(body_xml_path)
+                    fx, fy = get_origin(face_xml_path)
+                    
+                    # Calculate position
+                    # Body origin is at (bx, by) relative to body top-left
+                    # Face origin is at (fx, fy) relative to face top-left
+                    # We want Body Origin == Face Origin in world space
+                    # Face TopLeft = Body TopLeft + (bx, by) - (fx, fy)
+                    
+                    draw_x = bx - fx
+                    draw_y = by - fy
+                    
+                    painter = QPainter(body_img)
+                    painter.drawImage(draw_x, draw_y, face_img)
+                    painter.end()
+                except Exception as e:
+                    print(f"Error compositing face: {e}")
+        
+        return QPixmap.fromImage(body_img)
+
+    def __init__(self):
+        super().__init__()
+        
+        # 从配置文件读取显示设置
+        config = utils.get_config()
+        display_config = config.get('display', {})
+        preset_name = display_config.get('preset', 'balanced')
+        
+        # 如果使用预设
+        if preset_name in self.DISPLAY_PRESETS:
+            preset = self.DISPLAY_PRESETS[preset_name]
+            self.visible_ratio = preset['visible_ratio']
+            self.text_x_offset_default = preset['text_x_offset']
+            self.text_y_offset_default = preset['text_y_offset']
+            print(f"✓ 使用显示预设: {preset['name']} - {preset['description']}")
+        # 如果使用自定义配置
+        elif preset_name == 'custom':
+            custom_config = display_config.get('custom', {})
+            self.visible_ratio = custom_config.get('visible_ratio', 0.4)
+            self.text_x_offset_default = custom_config.get('text_x_offset', 140)
+            self.text_y_offset_default = custom_config.get('text_y_offset', 20)
+            print(f"✓ 使用自定义显示配置")
+        else:
+            # 默认使用平衡模式
+            preset = self.DISPLAY_PRESETS['balanced']
+            self.visible_ratio = preset['visible_ratio']
+            self.text_x_offset_default = preset['text_x_offset']
+            self.text_y_offset_default = preset['text_y_offset']
+            print(f"⚠ 未知预设 '{preset_name}'，使用默认: {preset['name']}")
+        
+        self.history = chat.identity()
+        self.emotion_history = []
+        self.embeddings_history = []
+
+        self._fade_bg = QLabel(self)
+        self._fade_fg = QLabel(self)
+        for lbl in (self._fade_bg, self._fade_fg):
+            lbl.setAttribute(Qt.WA_TranslucentBackground)
+            lbl.setVisible(False)
+            lbl.setGeometry(self.rect())
+            lbl.lower()
+        self._fade_bg_effect = QGraphicsOpacityEffect(self._fade_bg)
+        self._fade_fg_effect = QGraphicsOpacityEffect(self._fade_fg)
+        self._fade_bg.setGraphicsEffect(self._fade_bg_effect)
+        self._fade_fg.setGraphicsEffect(self._fade_fg_effect)
+        self._fade_anim = None
+
+        self.setWindowFlags(Qt.FramelessWindowHint |
+                            Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        
+        # 在 macOS 上使用原生 API 设置更高的窗口层级
+        self._setup_macos_window_level()
+
+        pixmap = self.get_shiroha_pixmap(startup=True)
+
+        # 考虑 HiDPI 缩放
+        scale_factor = 1.0
+        if hasattr(app, 'devicePixelRatio'):
+            scale_factor = app.devicePixelRatio()
+        elif hasattr(app.primaryScreen(), 'devicePixelRatio'):
+            scale_factor = app.primaryScreen().devicePixelRatio()
+
+        # 在 HiDPI 屏幕上进一步缩小
+        if scale_factor > 1.0:
+            pixmap = pixmap.scaled(pixmap.width() // int(scale_factor * 2),
+                                   pixmap.height() // int(scale_factor * 2),
+                                   Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        else:
+            pixmap = pixmap.scaled(pixmap.width() // 2, pixmap.height() // 2,
+                                   Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        self.setPixmap(pixmap)
+        # self.resize(pixmap.size())
+        self.setAlignment(Qt.AlignCenter)
+        self.resize(max(600, pixmap.width()), pixmap.height())
+
+        self._xfade_old = None
+        self._xfade_new = None
+        self._xfade_t = 1.0
+        self._xfade_anim = None
+
+        self.mousePressEvent = self.start_move
+        self.mouseMoveEvent = self.on_move
+        self.offset = None
+        self.touch_head = False
+        self.head_press_x = None
+
+        self.display_text = ""
+        self.text_font = QFont()
+        self.text_font.setFamily("思源黑体 CN Bold")
+
+        # 根据 HiDPI 调整字体大小
+        scale_factor = 1.0
+        if hasattr(app, 'devicePixelRatio'):
+            scale_factor = app.devicePixelRatio()
+        elif hasattr(app.primaryScreen(), 'devicePixelRatio'):
+            scale_factor = app.primaryScreen().devicePixelRatio()
+
+        font_size = 18
+        if scale_factor > 1.0:
+            font_size = int(18 / scale_factor)
+        self.text_font.setPointSize(font_size)
+
+        self.text_x_offset = 0
+        self.text_y_offset = 0
+        QFontDatabase.addApplicationFont("./思源黑体Bold.otf")
+
+        self.full_text = ""
+        self.typing_timer = QTimer()
+        self.typing_timer.timeout.connect(self._typing_step)
+        self.typing_interval = 40
+        self._typing_index = 0
+        self.typing_prefix = ""
+        
+        self.terminal_workers = []
+
+        self.setAttribute(Qt.WA_InputMethodEnabled, True)
+        self.input_mode = False
+        self.input_buffer = ""
+        self.preedit_text = ""
+
+        self.latest_response = "【 白羽 】\n  你好。"
+
+    def _setup_macos_window_level(self):
+        """在 macOS 上设置窗口层级，使其始终在最前但不抢占焦点"""
+        import platform
+        if platform.system() != 'Darwin':
+            return
+        
+        try:
+            # 使用 PyObjC 提供更优雅的 Cocoa API 访问
+            from AppKit import NSApp, NSWindow, NSFloatingWindowLevel
+            from PyQt5.QtGui import QWindow
+            
+            # 延迟设置，确保窗口已经创建
+            def set_level():
+                try:
+                    # 获取 Qt 窗口对应的 NSWindow
+                    ns_view = self.winId()
+                    if ns_view:
+                        # 通过 PyObjC 获取 NSWindow 对象
+                        from objc import objc_object
+                        import ctypes
+                        ns_view_ptr = ctypes.c_void_p(int(ns_view))
+                        
+                        # 使用 PyObjC 的对象包装
+                        from AppKit import NSView
+                        view = objc_object(c_void_p=ns_view_ptr)
+                        window = view.window()
+                        
+                        if window:
+                            # 设置窗口层级为浮动窗口级别（不抢占焦点）
+                            window.setLevel_(NSFloatingWindowLevel)
+                            print("✓ macOS window level set to NSFloatingWindowLevel")
+                except Exception as e:
+                    print(f"Failed to set window level with PyObjC: {e}")
+            
+            QTimer.singleShot(100, set_level)
+        except ImportError:
+            print("PyObjC not available, falling back to Qt window flags")
+            # 如果 PyObjC 未安装，回退到默认的 Qt.WindowStaysOnTopHint
+        except Exception as e:
+            print(f"Cannot setup macOS window level: {e}")
+
+    def event(self, event):
+        if event.type() == QEvent.WindowActivate:
+            print("activate")
+            if 'screen_worker' in globals():
+                screen_worker.should_capture = False
+                if hasattr(screen_worker, "interrupt_event"):
+                    screen_worker.interrupt_event.set()
+        elif event.type() == QEvent.WindowDeactivate:
+            print("deactivate")
+            self.input_mode = False
+            self.show_text(self.latest_response, typing=True)
+            if 'screen_worker' in globals():
+                screen_worker.should_capture = True
+        return super().event(event)
+
+    def cvimg_to_qpixmap(self, cv_img):
+        if cv_img.shape[2] == 4:
+            cv_img_bgra = cv2.cvtColor(cv_img, cv2.COLOR_RGBA2BGRA)
+            height, width, channel = cv_img_bgra.shape
+            bytes_per_line = 4 * width
+            qimg = QImage(cv_img_bgra.data, width, height,
+                          bytes_per_line, QImage.Format_RGBA8888)
+            return QPixmap.fromImage(qimg)
+
+    def start_move(self, event):
+        if event.button() == Qt.LeftButton:
+            rect = self.rect()
+            
+            # 由于只显示上半身，调整头部区域判断
+            # 头部区域应该是可见区域的上半部分
+            visible_height = int(self.height() * self.visible_ratio)  # 可见的部分
+            head_threshold = visible_height // 2  # 头部区域约为可见区域的上半部分
+            
+            if event.y() < head_threshold:
+                self.touch_head = True
+                self.head_press_x = event.x()
+                self.setCursor(Qt.OpenHandCursor)
+            else:
+                self.touch_head = False
+                self.head_press_x = None
+                self.setCursor(Qt.ArrowCursor)
+            # 检查是否点击了文本区域
+            text_clicked = False
+            if self.display_text:
+                # 计算文本区域
+                rect = self.rect()
+                text_rect = rect.adjusted(
+                    self.text_x_offset,
+                    self.text_y_offset,
+                    self.text_x_offset,
+                    -rect.height()//2 + self.text_y_offset
+                )
+                # 扩大点击区域，包含文本周围
+                expanded_rect = text_rect.adjusted(-20, -20, 20, 20)
+                if expanded_rect.contains(event.pos()):
+                    text_clicked = True
+
+            # 输入区域调整为可见区域的下半部分
+            input_threshold = int(visible_height * 0.7)
+            if event.y() > input_threshold or text_clicked:
+                self.input_mode = True
+                self.input_buffer = ""
+                self.display_text = "【 你 】\n  ..."
+                self.update()
+                return
+
+        if event.button() == Qt.MiddleButton:
+            self.offset = event.pos()
+            self.setCursor(Qt.SizeAllCursor)
+
+    def on_move(self, event):
+        # 检查左键是否按下，用于摸头交互
+        if self.touch_head and self.head_press_x is not None and event.buttons() & Qt.LeftButton:
+            if abs(event.x() - self.head_press_x) > 50:
+                self.llm_worker = LLMWorker(
+                    "主人摸了摸你的头", self.history, self.emotion_history, self.embeddings_history, role="system")
+                self.llm_worker.finished.connect(self.on_llm_result)
+                self.llm_worker.start()
+                self.touch_head = False
+                self.head_press_x = None
+        # 中键拖动窗口
+        if self.offset is not None and event.buttons() == Qt.MiddleButton:
+            self.move(self.pos() + event.pos() - self.offset)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MiddleButton:
+            self.offset = None
+            self.setCursor(Qt.ArrowCursor)
+        if event.button() == Qt.LeftButton:
+            self.touch_head = False
+            self.head_press_x = None
+            self.setCursor(Qt.ArrowCursor)
+
+    def show_text(self, text: str, x_offset: int = None, y_offset: int = None, typing: bool = True, typing_prefix: str = "【 白羽 】\n  "):
+        # 使用配置文件中的默认值
+        if x_offset is None:
+            x_offset = self.text_x_offset_default
+        if y_offset is None:
+            y_offset = self.text_y_offset_default
+            
+        # 根据缩放调整默认偏移量
+        scale_factor = 1.0
+        if hasattr(app, 'devicePixelRatio'):
+            scale_factor = app.devicePixelRatio()
+        elif hasattr(app.primaryScreen(), 'devicePixelRatio'):
+            scale_factor = app.primaryScreen().devicePixelRatio()
+
+        if scale_factor > 1.0:
+            x_offset = int(x_offset / scale_factor)
+            y_offset = int(y_offset / scale_factor)
+
+        self.text_x_offset = x_offset
+        self.text_y_offset = y_offset
+        self.typing_prefix = typing_prefix
+        if typing:
+            if typing_prefix and text.startswith(typing_prefix):
+                self.full_text = text[len(typing_prefix):]
+                self.display_text = typing_prefix
+            else:
+                self.full_text = text
+                self.display_text = ""
+            self._typing_index = 0
+            self.typing_timer.start(self.typing_interval)
+        else:
+            self.display_text = text
+            self.full_text = text
+            self.typing_timer.stop()
+            self.update()
+
+    def _typing_step(self):
+        if self._typing_index < len(self.full_text):
+            self.display_text = self.typing_prefix + \
+                self.full_text[:self._typing_index + 1]
+            self._typing_index += 1
+            self.update()
+        else:
+            self.typing_timer.stop()
+
+    def paintEvent(self, event):
+        if self._xfade_old is not None and self._xfade_new is not None:
+            w, h = self.width(), self.height()
+            img_old = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+            img_old.fill(0)
+            p = QPainter(img_old)
+            p.setCompositionMode(QPainter.CompositionMode_Source)
+            # Center the old image
+            x_old = (w - self._xfade_old.width()) // 2
+            y_old = (h - self._xfade_old.height()) // 2
+            p.drawPixmap(x_old, y_old, self._xfade_old)
+            p.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+            p.fillRect(img_old.rect(), QColor(
+                0, 0, 0, int((1.0 - self._xfade_t) * 255)))
+            p.end()
+            img_new = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+            img_new.fill(0)
+            p = QPainter(img_new)
+            p.setCompositionMode(QPainter.CompositionMode_Source)
+            # Center the new image
+            x_new = (w - self._xfade_new.width()) // 2
+            y_new = (h - self._xfade_new.height()) // 2
+            p.drawPixmap(x_new, y_new, self._xfade_new)
+            p.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+            p.fillRect(img_new.rect(), QColor(
+                0, 0, 0, int(self._xfade_t * 255)))
+            p.end()
+            blended = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+            blended.fill(0)
+            p = QPainter(blended)
+            p.setCompositionMode(QPainter.CompositionMode_Source)
+            p.drawImage(0, 0, img_old)
+            p.setCompositionMode(QPainter.CompositionMode_Plus)
+            p.drawImage(0, 0, img_new)
+            p.end()
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.drawImage(0, 0, blended)
+            if self.display_text:
+                painter.setRenderHint(QPainter.TextAntialiasing, True)
+                painter.setFont(self.text_font)
+                rect = self.rect()
+                
+                # Maximize text rect
+                margin = 10
+                text_rect = rect.adjusted(
+                    margin,
+                    self.text_y_offset,
+                    -margin,
+                    -rect.height()//2 + self.text_y_offset
+                )
+                
+                align_flag = Qt.AlignLeft | Qt.AlignBottom if '\n' in self.display_text else Qt.AlignHCenter | Qt.AlignBottom
+
+                # 根据缩放调整边框大小
+                scale_factor = 1.0
+                if hasattr(app, 'devicePixelRatio'):
+                    scale_factor = app.devicePixelRatio()
+                elif hasattr(app.primaryScreen(), 'devicePixelRatio'):
+                    scale_factor = app.primaryScreen().devicePixelRatio()
+
+                border_size = max(1, int(2 / scale_factor))
+                painter.setPen(QColor(44, 22, 28))
+                for dx, dy in [(-border_size, 0), (border_size, 0), (0, -border_size), (0, border_size),
+                               (border_size, -border_size), (border_size, border_size),
+                               (-border_size, -border_size), (-border_size, border_size)]:
+                    painter.drawText(text_rect.translated(
+                        dx, dy), align_flag, self.display_text)
+
+                painter.setPen(Qt.white)
+                painter.drawText(text_rect, align_flag, self.display_text)
+            painter.end()
+            return
+
+        super().paintEvent(event)
+        if self.display_text:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setRenderHint(QPainter.TextAntialiasing, True)
+            painter.setFont(self.text_font)
+            rect = self.rect()
+            
+            # Maximize text rect
+            margin = 10
+            text_rect = rect.adjusted(
+                margin,
+                self.text_y_offset,
+                -margin,
+                -rect.height()//2 + self.text_y_offset
+            )
+            
+            align_flag = Qt.AlignLeft | Qt.AlignBottom if '\n' in self.display_text else Qt.AlignHCenter | Qt.AlignBottom
+
+            # 根据缩放调整边框大小
+            scale_factor = 1.0
+            if hasattr(app, 'devicePixelRatio'):
+                scale_factor = app.devicePixelRatio()
+            elif hasattr(app.primaryScreen(), 'devicePixelRatio'):
+                scale_factor = app.primaryScreen().devicePixelRatio()
+
+            border_size = max(1, int(2 / scale_factor))
+            painter.setPen(QColor(44, 22, 28))
+            for dx, dy in [(-border_size, 0), (border_size, 0), (0, -border_size), (0, border_size),
+                           (border_size, -border_size), (border_size, border_size),
+                           (-border_size, -border_size), (-border_size, border_size)]:
+                painter.drawText(text_rect.translated(dx, dy),
+                                 align_flag, self.display_text)
+
+            painter.setPen(Qt.white)
+            painter.drawText(text_rect, align_flag, self.display_text)
+            painter.end()
+
+    def _get_fade_progress(self) -> float:
+        return self._xfade_t
+
+    def _set_fade_progress(self, value: float):
+        self._xfade_t = float(value)
+        self.update()
+
+    fadeProgress = pyqtProperty(
+        float, fget=_get_fade_progress, fset=_set_fade_progress)
+
+    def inputMethodQuery(self, query):
+        if query == Qt.ImMicroFocus:
+            rect = self.rect().adjusted(
+                self.text_x_offset,
+                self.text_y_offset,
+                self.text_x_offset,
+                -self.rect().height()//2 + self.text_y_offset
+            )
+            pos = self.mapToGlobal(rect.bottomLeft())
+            return QRect(pos, QSize(1, 30))
+        return super().inputMethodQuery(query)
+
+    def inputMethodEvent(self, event):
+        if self.input_mode:
+            commit = event.commitString()
+            preedit = event.preeditString()
+            if commit:
+                self.input_buffer += commit
+            self.preedit_text = preedit
+            wrapped = wrap_text(self.input_buffer + self.preedit_text)
+            self.display_text = f"【 你 】\n  「{wrapped}」"
+            self.update()
+        else:
+            super().inputMethodEvent(event)
+
+    def handle_user_input(self):
+        if 'screen_worker' in globals() and hasattr(screen_worker, "interrupt_event"):
+            screen_worker.interrupt_event.set()
+        # handle input here
+        self.llm_worker = LLMWorker(
+            self.input_buffer, self.history, self.emotion_history, self.embeddings_history, role="user")
+        self.llm_worker.finished.connect(self.on_llm_result)
+        self.llm_worker.start()
+
+    def on_llm_result(self, result, history, emotion_history, embeddings_history, embeddings_layers, raw_response, emotion):
+        raw_response_md5 = hashlib.md5(raw_response.replace("/no_think", "").encode()).hexdigest()
+        voice_path = os.path.join(os.getcwd(), 'voices', f"{raw_response_md5}.wav")
+        QSound.play(voice_path)
+        self.show_text(result, typing=True)
+        self.call_terminal_agent(self.input_buffer, result)
+        self.latest_response = result
+        self.input_buffer = ""
+        self.preedit_text = ""
+        self.history = history
+        self.emotion_history = emotion_history
+        self.embeddings_history = embeddings_history
+
+        self.switch_image("b", embeddings_layers, emotion)
+    
+    def call_terminal_agent(self, user_input, result):
+        # TODO: Add terminal operation here
+        if result:
+            worker = TerminalWorker(user_input, self)
+            worker.request_permission.connect(self.handle_permission_request)
+            worker.finished.connect(lambda: self.cleanup_terminal_worker(worker))
+            self.terminal_workers.append(worker)
+            worker.start()
+
+    def cleanup_terminal_worker(self, worker):
+        if worker in self.terminal_workers:
+            self.terminal_workers.remove(worker)
+
+    def handle_permission_request(self, operation):
+        worker = self.sender()
+        permission = self.check_user_permission(operation)
+        if worker and isinstance(worker, TerminalWorker):
+            worker.set_permission(permission)
+
+    def check_user_permission(self, operation):
+        # Here we can implement a simple permission check mechanism
+        # For example, we can ask the user via a dialog box
+        from PyQt5.QtWidgets import QMessageBox
+        msg_box = QMessageBox()
+        msg_box.setIcon(QMessageBox.Warning)
+        msg_box.setWindowTitle("Terminal Operation Permission")
+        msg_box.setText(f"The AI wants to execute the following terminal operation:\n\n{operation}\n\nDo you allow this?")
+        msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        ret = msg_box.exec_()
+        return ret == QMessageBox.Yes
+
+    def keyPressEvent(self, event):
+        if self.input_mode:
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                self.input_mode = False
+                self.handle_user_input()
+            elif event.key() == Qt.Key_Backspace:
+                if self.preedit_text:
+                    pass
+                else:
+                    self.input_buffer = self.input_buffer[:-1]
+                    wrapped = wrap_text(self.input_buffer)
+                    if not wrapped.strip():
+                        self.display_text = "【 你 】\n  ..."
+                    else:
+                        self.display_text = f"【 你 】\n  「{wrapped}」"
+                    self.update()
+            else:
+                char = event.text()
+                if char and not self.preedit_text:
+                    self.input_buffer += char
+                    wrapped = wrap_text(self.input_buffer)
+                    if not wrapped.strip():
+                        self.display_text = "【 你 】\n  ..."
+                    else:
+                        self.display_text = f"【 你 】\n  「{wrapped}」"
+                    self.update()
+        else:
+            super().keyPressEvent(event)
+
+    def switch_image(self, target, embeddings_layers, emotion=None):
+        pixmap_new = self.get_shiroha_pixmap(emotion_code=emotion)
+
+        # 考虑 HiDPI 缩放
+        scale_factor = 1.0
+        if hasattr(app, 'devicePixelRatio'):
+            scale_factor = app.devicePixelRatio()
+        elif hasattr(app.primaryScreen(), 'devicePixelRatio'):
+            scale_factor = app.primaryScreen().devicePixelRatio()
+
+        # 在 HiDPI 屏幕上进一步缩小
+        if scale_factor > 1.0:
+            pixmap_new = pixmap_new.scaled(pixmap_new.width() // int(scale_factor * 2),
+                                           pixmap_new.height() // int(scale_factor * 2),
+                                           Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        else:
+            pixmap_new = pixmap_new.scaled(pixmap_new.width() // 2, pixmap_new.height() // 2,
+                                           Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        pixmap_old = self.pixmap()
+        if pixmap_old is None:
+            self.setPixmap(pixmap_new)
+            # self.resize(pixmap_new.size())
+            self.resize(max(600, pixmap_new.width()), pixmap_new.height())
+            self.update()
+            return
+
+        self._xfade_old = pixmap_old
+        self._xfade_new = pixmap_new
+        self._xfade_t = 0.0
+
+        if self._xfade_anim:
+            self._xfade_anim.stop()
+        from PyQt5.QtCore import QPropertyAnimation
+        self._xfade_anim = QPropertyAnimation(self, b"fadeProgress")
+        self._xfade_anim.setDuration(400)
+        self._xfade_anim.setStartValue(0.0)
+        self._xfade_anim.setEndValue(1.0)
+
+        def finish():
+            self.setPixmap(pixmap_new)
+            # self.resize(pixmap_new.size())
+            self.resize(max(600, pixmap_new.width()), pixmap_new.height())
+            self._xfade_old = None
+            self._xfade_new = None
+            self._xfade_anim = None
+            self.update()
+
+        self._xfade_anim.finished.connect(finish)
+        self._xfade_anim.start()
+
+    def closeEvent(self, event):
+        print("Closing Shiroha, stopping workers...")
+        for worker in list(self.terminal_workers):
+            if worker.isRunning():
+                worker.stop()
+                worker.quit()
+                worker.wait()
+        event.accept()
+
+##负责周期性截图的函数
+
+class ScreenWorker(QThread):
+    screen_result = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.running = True
+        self.history = []
+        self.should_capture = False
+        self.llmworker = None
+        self.interrupt_event = threading.Event()
+
+    def run(self):
+        while self.running:
+            print(self.should_capture, "should_capture")
+            if self.should_capture:
+                self.interrupt_event.clear()
+                try:
+                    screenshot = pyautogui.screenshot()
+                    sys_prompt = '''你现在要担任一个AI桌宠的视觉识别助手，我会向你提供用户此时的屏幕截图，你要识别用户此时的行为，并进行描述。我会将你的描述以system消息提供给另外一个处理语言的AI模型。'''
+                    response, _ = chat.query_image(screenshot, "现在请描述用户此时的行为", [
+                        {"role": "system", "content": sys_prompt}])
+                    des, self.history = chat.think_image(
+                        response, self.history)
+                    if des['des']:
+                        print("scr worker：", des['des'])
+                        self.llmworker = LLMWorker(
+                            des['des'], self.history, [], [], role="system", interrupt_event=self.interrupt_event
+                        )
+                        self.screen_result.emit(des['des'])
+
+                        self.llmworker.start()
+                        self.llmworker.wait()
+                finally:
+                    pass
+            time.sleep(30)
+
+    def stop(self):
+        self.running = False
+        if self.llmworker and self.llmworker.isRunning():
+            self.interrupt_event.set()
+
+    def on_llm_result(self, *args):
+        pass
+
+
+class TerminalWorker(QThread):
+    request_permission = pyqtSignal(str)
+    
+    def __init__(self, user_input, parent=None):
+        super().__init__(parent)
+        self.user_input = user_input
+        self.permission_result = False
+        self.permission_event = threading.Event()
+        self.running = True
+
+    def stop(self):
+        self.running = False
+        self.permission_event.set()
+
+    def run(self):
+        try:
+            terminal_agent = TerminalAgent(self.user_input)
+            is_finish = False
+            while self.running and not is_finish:
+                operation, operation_type, is_finish = terminal_agent.get_terminal_operation()
+                if not operation:
+                    print("No operation returned, ending terminal operations.")
+                    break
+                
+                if not self.running:
+                    break
+
+                permission = True
+                # if operation_type == Operationtype.TERMINAL:
+                #     self.permission_event.clear()
+                #     self.request_permission.emit(operation)
+                #     self.permission_event.wait()
+                #     if not self.running:
+                #         break
+                #     permission = self.permission_result
+
+                self.permission_event.clear()
+                self.request_permission.emit(operation)
+                self.permission_event.wait()
+                if not self.running:
+                    break
+                permission = self.permission_result
+                
+                if permission:
+                    terminal_agent.execute_operation(operation, operation_type)
+
+                else:
+                    print("Terminal operation denied by user.")
+                    break
+        except Exception as e:
+            print(f"TerminalWorker error: {e}")
+            traceback.print_exc()
+
+    def set_permission(self, result):
+        self.permission_result = result
+        self.permission_event.set()
+
+
+class LLMWorker(QThread):
+    finished = pyqtSignal(str, list, list, list, list, str, str)
+
+    def __init__(self, prompt, history, emotion_history, embeddings_history, role="user", interrupt_event=None):
+        super().__init__()
+        self.prompt = prompt
+        self.history = history
+        self.role = role
+        self.emotion_history = emotion_history
+        self.embeddings_history = embeddings_history
+        self.interrupt_event = interrupt_event
+
+    def run(self):
+        try:
+            t_start = time.time()
+            hour = datetime.now().hour
+            minute = datetime.now().minute
+            if 0 <= hour < 5:
+                period = "凌晨"
+            elif 5 <= hour < 12:
+                period = "早上"
+            elif 12 <= hour < 18:
+                period = "下午"
+            elif 18 <= hour < 24:
+                period = "晚上"
+            self.history.append(
+                {"role": "system", "content": f"现在是{period}{hour}点{minute}分"})
+
+            if self.interrupt_event and self.interrupt_event.is_set():
+                print("LLMWorker interrupted before start")
+                return
+
+            response, history = chat.query(
+                prompt=self.prompt,
+                history=self.history,
+                role=self.role
+            )
+
+            if response.strip() == '……' or response.strip() == '...':
+                response = "（不知道该说什么）"
+
+            # print("!!!!!!!!!!!!!!!!!!!!!!!! response : ", response)
+
+            if self.interrupt_event and self.interrupt_event.is_set():
+                print("LLMWorker interrupted before start")
+                return
+
+            response, translated = chat.get_translate(response)
+
+            if self.interrupt_event and self.interrupt_event.is_set():
+                print("LLMWorker interrupted before start")
+                return
+
+            emotion, emotion_history = chat.get_emotion(
+                f"用户：{self.prompt}\n白羽：{response}", self.emotion_history)
+
+            if self.interrupt_event and self.interrupt_event.is_set():
+                print("LLMWorker interrupted before start")
+                return
+
+            tts_thread = threading.Thread(
+                target=chat.generate_tts, args=(translated, emotion), daemon=True)
+            tts_thread.start()
+
+            if self.interrupt_event and self.interrupt_event.is_set():
+                print("LLMWorker interrupted before start")
+                return
+
+            # embeddings_layers, embeddings_history = chat.get_embedings_layers(
+            #     response, "b", self.embeddings_history)
+            embeddings_layers = []
+            embeddings_history = self.embeddings_history
+
+            if self.interrupt_event and self.interrupt_event.is_set():
+                print("LLMWorker interrupted before start")
+                return
+            raw_response_md5 = hashlib.md5(translated.replace("/no_think", "").encode()).hexdigest()
+            voice_path = f"./voices/{raw_response_md5}.wav"
+            
+            while not os.path.exists(voice_path):
+                time.sleep(0.1)
+
+            print(len(history), "history")
+            print(embeddings_layers, "b")
+            print(time.time() - t_start, "sec")
+            print("Emitting ============")
+
+            result = f"「{wrap_text(response)}」"
+            self.finished.emit(result, history, emotion_history,
+                               embeddings_history, embeddings_layers, translated, emotion)
+        except Exception as e:
+            print("--- LLMWorker Error ---")
+            tb_str = traceback.format_exc()
+            print(tb_str)
+            print("-----------------------")
+
+            # 创建错误日志目录和文件
+            error_log_dir = os.path.join('logs', 'error')
+            os.makedirs(error_log_dir, exist_ok=True)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            error_log_path = os.path.join(error_log_dir, f'error_{timestamp}.log')
+
+            # 准备日志内容
+            log_content = f"""--- LLMWorker Error Log ---
+Timestamp: {datetime.now().isoformat()}
+
+Prompt that caused the error:
+------------------------------
+{self.prompt}
+
+Full Conversation History (at time of error):
+---------------------------------------------
+{json.dumps(self.history, indent=2, ensure_ascii=False)}
+
+Traceback:
+----------
+{tb_str}
+"""
+            # 写入日志文件
+            try:
+                with open(error_log_path, 'w', encoding='utf-8') as f:
+                    f.write(log_content)
+                print(f"✓ Error details logged to: {error_log_path}")
+            except Exception as log_e:
+                print(f"!!! FAILED TO WRITE ERROR LOG: {log_e}")
+
+
+            error_message = f"【 系统错误 】\n  {type(e).__name__}"
+            # 发送错误信号，使用空列表以匹配信号签名
+            self.finished.emit(error_message, self.history, self.emotion_history,
+                               self.embeddings_history, [], "Error")
+
+
+def clear_history(parent):
+    from PyQt5.QtWidgets import QMessageBox
+    reply = QMessageBox.question(parent, "Clear History", "Are you sure you want to clear the history?",
+                                 QMessageBox.Ok | QMessageBox.Cancel)
+    if reply == QMessageBox.Ok:
+        shiroha.history = chat.identity()
+        shiroha.emotion_history = []
+        shiroha.embeddings_history = []
+
+
+if __name__ == "__main__":
+    history = chat.identity()
+
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    shiroha = Shiroha()
+
+    # 动态计算窗口位置，只显示上半身
+    screen = app.primaryScreen()
+    screen_geometry = screen.availableGeometry()
+    window_width = shiroha.width()
+    window_height = shiroha.height()
+
+    # 放在右下角，只显示上半身
+    x = screen_geometry.width() - window_width - 30
+    # 让窗口下半部分超出屏幕，只显示上半身
+    y = screen_geometry.height() - int(window_height * shiroha.visible_ratio)
+
+    shiroha.move(x, y)
+    shiroha.show()
+
+    tray_icon = QSystemTrayIcon(QIcon("icon.jpg"), parent=app)
+    tray_menu = QMenu()
+
+    clear_action = QAction("Clear History")
+    clear_action.triggered.connect(lambda: clear_history(shiroha))
+    exit_action = QAction("Exit")
+    exit_action.triggered.connect(app.quit)
+
+    tray_menu.addAction(clear_action)
+    tray_menu.addAction(exit_action)
+    tray_icon.setContextMenu(tray_menu)
+    tray_icon.show()
+
+    shiroha.show_text(shiroha.latest_response, typing=True)
+
+    if utils.get_config()['enable_vl']:
+        screen_worker = ScreenWorker()
+
+        def handle_screen_result(des_text):
+            shiroha.llm_worker = LLMWorker(
+                des_text, shiroha.history, shiroha.emotion_history, shiroha.embeddings_history, role="system"
+            )
+            shiroha.llm_worker.finished.connect(shiroha.on_llm_result)
+            shiroha.llm_worker.start()
+
+        screen_worker.screen_result.connect(handle_screen_result)
+        screen_worker.start()
+
+    sys.exit(app.exec_())
